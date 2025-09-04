@@ -1,0 +1,29 @@
+cat > .gitignore << 'EOF'
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Editor/OS
+.DS_Store
+.idea/
+.vscode/
+
+# Streamlit secrets (if you add later)
+.streamlit/secrets.toml
+
+# Our outputs and temp
+MeetingTranscripts/
+*.tmp
+*.tmp.wav
+EOF
