@@ -69,9 +69,15 @@ with tab1:
         """
     )
 
-    # Default the endpoint from secrets if provided, else localhost for dev
+# Default the endpoint from secrets if provided, else localhost for dev
     endpoint_default = "https://transcribe-0kv2.onrender.com/upload"
     endpoint = st.text_input("Upload endpoint", value=endpoint_default, help="Your FastAPI /upload URL")
+
+    # 👇 ADD THESE 3 LINES (right here)
+    base = endpoint.rsplit("/upload", 1)[0] if endpoint.endswith("/upload") else endpoint
+    recorder_url = f"{base}/capture?model={model_choice}&min={int(min_speakers)}&max={int(max_speakers)}"
+    st.link_button("Open Web Recorder (new tab)", recorder_url,
+                   help="Use this if the Start button doesn't open the screen/mic picker on Streamlit Cloud.")
 
     st.components.v1.html(
         f"""

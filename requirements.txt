@@ -10,6 +10,8 @@ ctranslate2>=4.3
 
 # DL stack (CPU)
 torch>=2.0
+boto3>=1.34
+
 
 # Diarization (ECAPA embeddings)
 speechbrain>=0.5.16
