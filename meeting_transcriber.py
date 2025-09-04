@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Meeting Scribe (CPU-only): Start/Stop GUI to record system audio + mic, then transcribe + diarize.
-Outputs: .md, .srt, .txt saved in ~/MeetingTranscripts
+Meeting Scribe (CPU-only)
+- Records (Linux/PulseAudio) system audio + mic (optional local GUI)
+- Transcribes with faster-whisper (CPU int8)
+- Diarizes with SpeechBrain ECAPA + Agglomerative clustering (cosine, silhouette K)
+- Outputs: .md, .srt, .txt in ~/MeetingTranscripts
 
-- Recording: FFmpeg via PulseAudio/PipeWire monitor + default mic (no Zoom/Meet banner).
-- ASR: faster-whisper (CPU int8) with word_timestamps=True.
-- Diarization: ECAPA embeddings on sliding windows + Agglomerative (cosine) with silhouette model selection.
-- Robust: energy gate (dBFS) + smoothed 0.1s speaker track → per-word labels → one block per speaker turn, with short interjections kept.
+This module is **Streamlit/Server safe**:
+- tkinter import is optional; GUI parts only load if Tk is available.
+- Core pipeline (transcribe_and_diarize) is importable without a GUI.
+- Torch threads are capped for low-memory environments.
 
-Legal: Ensure recording/transcription complies with laws and policies where you use this.
+Legal: Ensure recording/transcription complies with laws where you use this.
 """
 
-# meeting_transcriber.py (top)
+from __future__ import annotations
 import platform
-OS_NAME = platform.system()  # "Linux", "Darwin" (macOS), "Windows"
-
 import signal
 import queue
 import threading
@@ -23,6 +24,7 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 from dataclasses import dataclass
+import os
 
 import numpy as np
 import soundfile as sf
@@ -35,25 +37,35 @@ from sklearn.cluster import AgglomerativeClustering
 from sklearn.metrics import silhouette_score
 from sklearn.preprocessing import normalize
 
-import tkinter as tk
-from tkinter import ttk, messagebox
-
-# ---------------------- Config ----------------------
-DEFAULT_MODEL = "tiny.en"      # tiny.en / base.en / small.en / medium (CPU)
-EMB_WIN = 2.0                  # seconds (embedding window) — longer = stabler speakers
-EMB_HOP = 0.5                  # seconds (hop) — finer resolution of changes
-TRACK_STEP = 0.10              # seconds (speaker track resolution)
-SMOOTH_KERNEL = 7              # median filter kernel (odd)
-MIN_HOLD_S = 0.9               # min duration to keep a run as a turn (reduce if over-merge)
-MAX_INTERJECT_S = 0.7          # keep short different-speaker runs as interjections
-RMS_THRESH_DBFS = -48.0        # energy gate for windows (skip very quiet segments)
-DEFAULT_MIN_SPK = 2            # expected minimum speakers
-DEFAULT_MAX_SPK = 6            # maximum speakers
-
-import torch
+# ---------- Optional GUI: make Tk safe to import in server environments ----------
 try:
-    torch.set_num_threads(1)
-    torch.set_num_interop_threads(1)
+    import tkinter as tk
+    from tkinter import ttk, messagebox
+    GUI_AVAILABLE = True
+except Exception:
+    GUI_AVAILABLE = False
+    tk = None; ttk = None; messagebox = None
+
+# ---------- OS ----------
+OS_NAME = platform.system()  # "Linux", "Darwin", "Windows"
+
+# ---------- Config ----------
+# Keep tiny.en as default for small CPU instances; can be overridden by env vars.
+DEFAULT_MODEL = os.environ.get("MS_DEFAULT_MODEL", "tiny.en")  # "tiny.en"|"base.en"|"small.en"|"medium"
+EMB_WIN = float(os.environ.get("MS_EMB_WIN", 2.0))             # seconds
+EMB_HOP = float(os.environ.get("MS_EMB_HOP", 0.5))             # seconds
+TRACK_STEP = float(os.environ.get("MS_TRACK_STEP", 0.10))      # seconds
+SMOOTH_KERNEL = int(os.environ.get("MS_SMOOTH_KERNEL", 7))     # odd number
+MIN_HOLD_S = float(os.environ.get("MS_MIN_HOLD_S", 0.9))
+MAX_INTERJECT_S = float(os.environ.get("MS_MAX_INTR_S", 0.7))
+RMS_THRESH_DBFS = float(os.environ.get("MS_RMS_THRESH_DBFS", -48.0))
+DEFAULT_MIN_SPK = int(os.environ.get("MS_MIN_SPK", 2))
+DEFAULT_MAX_SPK = int(os.environ.get("MS_MAX_SPK", 6))
+
+# Cap torch threads (important on small instances)
+try:
+    torch.set_num_threads(int(os.environ.get("MS_TORCH_THREADS", "1")))
+    torch.set_num_interop_threads(int(os.environ.get("MS_TORCH_INTEROP", "1")))
 except Exception:
     pass
 
@@ -66,7 +78,11 @@ def run_cmd(cmd):
     return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
 
 def get_default_sources():
-    """Return (monitor_source_name, mic_source_name) using pactl (PulseAudio/PipeWire)."""
+    """
+    Linux only: Return (monitor_source_name, mic_source_name) using pactl (PulseAudio/PipeWire).
+    """
+    if OS_NAME != "Linux":
+        raise RuntimeError("start_recording currently supports Linux (PulseAudio/PipeWire) only.")
     rc, default_sink, _ = run_cmd(["pactl", "get-default-sink"])
     if rc != 0 or not default_sink:
         raise RuntimeError("Cannot get default sink. Is PulseAudio/PipeWire running?")
@@ -98,7 +114,7 @@ def get_default_sources():
 def timestamp():
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
-# ---------------------- Recording ----------------------
+# ---------------------- Recording (Linux) ----------------------
 @dataclass
 class RecordingState:
     process: subprocess.Popen | None = None
@@ -106,6 +122,9 @@ class RecordingState:
     running: bool = False
 
 def start_recording(sample_rate=16000):
+    """
+    Start recording system audio (monitor) + mic via FFmpeg (Linux/PulseAudio).
+    """
     mon, mic = get_default_sources()
     out = OUTPUT_DIR / f"meeting_{timestamp()}.wav"
     cmd = [
@@ -250,7 +269,7 @@ def choose_k_and_cluster(embs, min_k, max_k, log=lambda *_: None):
     return best_labels
 
 # ---------------------- Main pipeline ----------------------
-def transcribe_and_diarize(wav_path: Path, model_name, min_speakers, max_speakers, log_cb=None):
+def transcribe_and_diarize(wav_path: Path, model_name: str, min_speakers: int, max_speakers: int, log_cb=None):
     log = (lambda msg: log_cb(msg)) if log_cb else print
 
     log("Loading audio...")
@@ -266,7 +285,7 @@ def transcribe_and_diarize(wav_path: Path, model_name, min_speakers, max_speaker
         except Exception:
             pass
 
-    log(f"ASR (faster-whisper {model_name}, word timestamps)...")
+    log(f"ASR (faster-whisper {model_name}, word timestamps, int8 CPU)...")
     asr = WhisperModel(model_name, device="cpu", compute_type="int8")
     segments, _ = asr.transcribe(str(wav_path),
                                  vad_filter=True,
@@ -375,115 +394,123 @@ def merge_words_into_turns(words):
         segments_out.append(cur)
     return segments_out
 
-# ---------------------- GUI ----------------------
-class MeetingScribeApp:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("Meeting Scribe (CPU)")
-        self.root.geometry("740x430")
-        self.state = None
-        self.worker = None
-        self.log_queue = queue.Queue()
-        self.model_var = tk.StringVar(value=DEFAULT_MODEL)
-        self.min_spk_var = tk.IntVar(value=DEFAULT_MIN_SPK)
-        self.max_spk_var = tk.IntVar(value=DEFAULT_MAX_SPK)
+# ---------------------- Optional Tk GUI ----------------------
+if GUI_AVAILABLE:
+    class MeetingScribeApp:
+        def __init__(self, root):
+            self.root = root
+            self.root.title("Meeting Scribe (CPU)")
+            self.root.geometry("740x430")
+            self.state = None
+            self.worker = None
+            self.log_queue = queue.Queue()
+            self.model_var = tk.StringVar(value=DEFAULT_MODEL)
+            self.min_spk_var = tk.IntVar(value=DEFAULT_MIN_SPK)
+            self.max_spk_var = tk.IntVar(value=DEFAULT_MAX_SPK)
 
-        frm = ttk.Frame(root, padding=12)
-        frm.pack(fill=tk.BOTH, expand=True)
+            frm = ttk.Frame(root, padding=12)
+            frm.pack(fill=tk.BOTH, expand=True)
 
-        # Model
-        ttk.Label(frm, text="Whisper model (CPU):").grid(row=0, column=0, sticky="w")
-        self.model_dd = ttk.Combobox(frm, textvariable=self.model_var,
-                                     values=["tiny.en", "base.en", "small.en", "medium"],
-                                     state="readonly", width=12)
-        self.model_dd.grid(row=0, column=1, sticky="w", padx=(8, 16))
+            # Model
+            ttk.Label(frm, text="Whisper model (CPU):").grid(row=0, column=0, sticky="w")
+            self.model_dd = ttk.Combobox(frm, textvariable=self.model_var,
+                                         values=["tiny.en", "base.en", "small.en", "medium"],
+                                         state="readonly", width=12)
+            self.model_dd.grid(row=0, column=1, sticky="w", padx=(8, 16))
 
-        # Min / Max speakers
-        ttk.Label(frm, text="Min speakers:").grid(row=0, column=2, sticky="e")
-        self.min_spk_dd = ttk.Combobox(frm, textvariable=self.min_spk_var,
-                                       values=[1,2,3,4,5,6,7,8], state="readonly", width=4)
-        self.min_spk_dd.grid(row=0, column=3, sticky="w", padx=(6, 16))
+            # Min / Max speakers
+            ttk.Label(frm, text="Min speakers:").grid(row=0, column=2, sticky="e")
+            self.min_spk_dd = ttk.Combobox(frm, textvariable=self.min_spk_var,
+                                           values=[1,2,3,4,5,6,7,8], state="readonly", width=4)
+            self.min_spk_dd.grid(row=0, column=3, sticky="w", padx=(6, 16))
 
-        ttk.Label(frm, text="Max speakers:").grid(row=0, column=4, sticky="e")
-        self.max_spk_dd = ttk.Combobox(frm, textvariable=self.max_spk_var,
-                                       values=[2,3,4,5,6,7,8,9,10], state="readonly", width=4)
-        self.max_spk_dd.grid(row=0, column=5, sticky="w")
+            ttk.Label(frm, text="Max speakers:").grid(row=0, column=4, sticky="e")
+            self.max_spk_dd = ttk.Combobox(frm, textvariable=self.max_spk_var,
+                                           values=[2,3,4,5,6,7,8,9,10], state="readonly", width=4)
+            self.max_spk_dd.grid(row=0, column=5, sticky="w")
 
-        self.start_btn = ttk.Button(frm, text="Start Recording", command=self.on_start, width=20)
-        self.stop_btn  = ttk.Button(frm, text="Stop & Transcribe", command=self.on_stop, width=20, state="disabled")
-        self.start_btn.grid(row=1, column=0, pady=10, sticky="w")
-        self.stop_btn.grid(row=1, column=1, pady=10, sticky="w")
+            self.start_btn = ttk.Button(frm, text="Start Recording", command=self.on_start, width=20)
+            self.stop_btn  = ttk.Button(frm, text="Stop & Transcribe", command=self.on_stop, width=20, state="disabled")
+            self.start_btn.grid(row=1, column=0, pady=10, sticky="w")
+            self.stop_btn.grid(row=1, column=1, pady=10, sticky="w")
 
-        self.status_var = tk.StringVar(value="Ready.")
-        ttk.Label(frm, textvariable=self.status_var).grid(row=2, column=0, columnspan=6, sticky="w")
+            self.status_var = tk.StringVar(value="Ready.")
+            ttk.Label(frm, textvariable=self.status_var).grid(row=2, column=0, columnspan=6, sticky="w")
 
-        self.log_txt = tk.Text(frm, height=16, wrap="word")
-        self.log_txt.grid(row=3, column=0, columnspan=6, sticky="nsew", pady=(8, 0))
-        for c in range(6):
-            frm.columnconfigure(c, weight=1 if c in (1,3,5) else 0)
-        frm.rowconfigure(3, weight=1)
+            self.log_txt = tk.Text(frm, height=16, wrap="word")
+            self.log_txt.grid(row=3, column=0, columnspan=6, sticky="nsew", pady=(8, 0))
+            for c in range(6):
+                frm.columnconfigure(c, weight=1 if c in (1,3,5) else 0)
+            frm.rowconfigure(3, weight=1)
 
-        self.root.after(200, self._poll_logs)
+            self.root.after(200, self._poll_logs)
 
-    def log(self, msg):
-        self.log_queue.put(msg)
+        def log(self, msg):
+            self.log_queue.put(msg)
 
-    def _poll_logs(self):
-        try:
-            while True:
-                msg = self.log_queue.get_nowait()
-                self.log_txt.insert("end", msg + "\n")
-                self.log_txt.see("end")
-        except queue.Empty:
-            pass
-        self.root.after(200, self._poll_logs)
+        def _poll_logs(self):
+            try:
+                while True:
+                    msg = self.log_queue.get_nowait()
+                    self.log_txt.insert("end", msg + "\n")
+                    self.log_txt.see("end")
+            except queue.Empty:
+                pass
+            self.root.after(200, self._poll_logs)
 
-    def on_start(self):
-        try:
-            self.status_var.set("Starting recording...")
-            self.state = start_recording()
-            self.status_var.set(f"Recording → {self.state.wav_path}")
-            self.start_btn.config(state="disabled")
-            self.stop_btn.config(state="normal")
-            self.log(f"[{datetime.now().strftime('%H:%M:%S')}] Recording started.")
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to start recording:\n{e}")
-            self.status_var.set("Ready.")
+        def on_start(self):
+            try:
+                self.status_var.set("Starting recording...")
+                self.state = start_recording()
+                self.status_var.set(f"Recording → {self.state.wav_path}")
+                self.start_btn.config(state="disabled")
+                self.stop_btn.config(state="normal")
+                self.log(f"[{datetime.now().strftime('%H:%M:%S')}] Recording started.")
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to start recording:\n{e}")
+                self.status_var.set("Ready.")
 
-    def on_stop(self):
-        if not self.state or not self.state.running:
-            return
-        self.status_var.set("Stopping recording...")
-        stop_recording(self.state)
-        self.start_btn.config(state="normal")
-        self.stop_btn.config(state="disabled")
-        self.log(f"[{datetime.now().strftime('%H:%M:%S')}] Recording stopped.")
-        wav_path = self.state.wav_path
-        self.status_var.set("Transcribing + diarizing (CPU)...")
+        def on_stop(self):
+            if not self.state or not self.state.running:
+                return
+            self.status_var.set("Stopping recording...")
+            stop_recording(self.state)
+            self.start_btn.config(state="normal")
+            self.stop_btn.config(state="disabled")
+            self.log(f"[{datetime.now().strftime('%H:%M:%S')}] Recording stopped.")
+            wav_path = self.state.wav_path
+            self.status_var.set("Transcribing + diarizing (CPU)...")
 
-        args = (wav_path, self.model_var.get(), int(self.min_spk_var.get()), int(self.max_spk_var.get()))
-        self.worker = threading.Thread(target=self._process_file, args=args, daemon=True)
-        self.worker.start()
+            args = (wav_path, self.model_var.get(), int(self.min_spk_var.get()), int(self.max_spk_var.get()))
+            self.worker = threading.Thread(target=self._process_file, args=args, daemon=True)
+            self.worker.start()
 
-    def _process_file(self, wav_path: Path, model_name: str, min_spk: int, max_spk: int):
-        try:
-            def cb(m): self.log(m)
-            # ensure min <= max
-            min_spk = max(1, min(min_spk, max_spk))
-            max_spk = max(min_spk, max_spk)
-            segments_out = transcribe_and_diarize(wav_path, model_name, min_spk, max_spk, log_cb=cb)
-            md, srt, txt = save_outputs(wav_path, segments_out)
-            self.log(f"Saved:\n- {md}\n- {srt}\n- {txt}")
-            self.status_var.set("Done. Files saved in ~/MeetingTranscripts")
-        except Exception as e:
-            self.status_var.set("Failed.")
-            self.log(f"ERROR: {e}")
-            messagebox.showerror("Error", f"Processing failed:\n{e}")
+        def _process_file(self, wav_path: Path, model_name: str, min_spk: int, max_spk: int):
+            try:
+                def cb(m): self.log(m)
+                # ensure min <= max
+                min_spk = max(1, min(min_spk, max_spk))
+                max_spk = max(min_spk, max_spk)
+                segments_out = transcribe_and_diarize(wav_path, model_name, min_spk, max_spk, log_cb=cb)
+                md, srt, txt = save_outputs(wav_path, segments_out)
+                self.log(f"Saved:\n- {md}\n- {srt}\n- {txt}")
+                self.status_var.set("Done. Files saved in ~/MeetingTranscripts")
+            except Exception as e:
+                self.status_var.set("Failed.")
+                self.log(f"ERROR: {e}")
+                messagebox.showerror("Error", f"Processing failed:\n{e}")
 
-def main():
-    root = tk.Tk()
-    app = MeetingScribeApp(root)
-    root.mainloop()
+    def main():
+        root = tk.Tk()
+        app = MeetingScribeApp(root)
+        root.mainloop()
+else:
+    # Non-GUI environments (e.g., Streamlit Cloud / FastAPI server)
+    def main():
+        print("GUI not available in this environment (tkinter missing).")
+        print("The transcription pipeline APIs are still usable for server/Streamlit.")
+        return
 
+# ---------------------- Entrypoint ----------------------
 if __name__ == "__main__":
     main()

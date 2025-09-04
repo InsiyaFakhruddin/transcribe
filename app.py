@@ -50,7 +50,7 @@ with tab1:
         """
     )
 
-    endpoint = st.text_input("Upload endpoint", value="http://localhost:7861/upload",
+    endpoint = st.text_input("Upload endpoint", value="https://transcribe-0kv2.onrender.com/upload",
                              help="Your FastAPI /upload URL from server.py")
 
     # NOTE: We pass your chosen model/min/max from the sidebar into JS (simple strings/ints).
