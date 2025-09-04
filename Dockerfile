@@ -1,21 +1,26 @@
 # Dockerfile
 FROM python:3.11-slim
 
-# System deps (ffmpeg)
+# System deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg git && rm -rf /var/lib/apt/lists/*
 
-# Workdir & copy
-WORKDIR /app
-COPY requirements.txt /app/requirements.txt
+# Env: keep caches under /root/.cache (default)
+ENV HF_HOME=/root/.cache \
+    TORCH_HOME=/root/.cache \
+    SPEECHBRAIN_CACHE=/root/.cache \
+    OMP_NUM_THREADS=1
 
-# Faster installs
+WORKDIR /app
+
+COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -U pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# Copy the rest
+# copy code and warm up models into image layers (faster cold starts)
 COPY . /app
+RUN python warmup_models.py
 
-# Expose port for FastAPI
+# Run FastAPI
 ENV PORT=7861
 CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "7861"]

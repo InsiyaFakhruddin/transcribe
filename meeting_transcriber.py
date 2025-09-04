@@ -39,7 +39,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 
 # ---------------------- Config ----------------------
-DEFAULT_MODEL = "base.en"      # tiny.en / base.en / small.en / medium (CPU)
+DEFAULT_MODEL = "tiny.en"      # tiny.en / base.en / small.en / medium (CPU)
 EMB_WIN = 2.0                  # seconds (embedding window) — longer = stabler speakers
 EMB_HOP = 0.5                  # seconds (hop) — finer resolution of changes
 TRACK_STEP = 0.10              # seconds (speaker track resolution)
@@ -49,6 +49,13 @@ MAX_INTERJECT_S = 0.7          # keep short different-speaker runs as interjecti
 RMS_THRESH_DBFS = -48.0        # energy gate for windows (skip very quiet segments)
 DEFAULT_MIN_SPK = 2            # expected minimum speakers
 DEFAULT_MAX_SPK = 6            # maximum speakers
+
+import torch
+try:
+    torch.set_num_threads(1)
+    torch.set_num_interop_threads(1)
+except Exception:
+    pass
 
 OUTPUT_DIR = Path.home() / "MeetingTranscripts"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
